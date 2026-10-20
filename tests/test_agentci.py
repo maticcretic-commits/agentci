@@ -9,9 +9,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from agentci import (cmd_compare, cmd_init, cmd_run, compare_reports,
+from agentci import (VERSION, cmd_compare, cmd_init, cmd_run, compare_reports,
                      evaluate_case, evaluate_check, load_cases, load_outputs,
-                     run_suite)
+                     main, run_suite)
 
 
 # ---------------------------------------------------------------------------
@@ -292,3 +292,98 @@ def test_init_refuses_to_overwrite(tmp_path, capsys):
     cmd_init(argparse.Namespace(force=False, dir=str(tmp_path)))
     cmd_init(argparse.Namespace(force=False, dir=str(tmp_path)))
     assert "exists" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Envelope / version / error envelope (Phase 1 conventions)
+# ---------------------------------------------------------------------------
+
+def test_run_json_envelope_keys(capsys):
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = write(tmp, "cases.json", {"agent": "x", "cases": CASES})
+        outputs = write(tmp, "outputs.json",
+                        {"a": "refund", "b": "a sufficiently long answer",
+                         "c": "order 42"})
+        args = argparse.Namespace(cases=cases, outputs=outputs,
+                                  json=True, save=None)
+        with pytest.raises(SystemExit) as ei:
+            cmd_run(args)
+        assert ei.value.code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["tool"] == "agentci"
+        assert parsed["version"] == VERSION == "1.0.0"
+        assert parsed["schema_version"] == 1
+
+
+def test_run_save_file_has_envelope_keys(capsys, tmp_path):
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = write(tmp, "cases.json", {"agent": "x", "cases": CASES})
+        outputs = write(tmp, "outputs.json",
+                        {"a": "refund", "b": "a sufficiently long answer",
+                         "c": "order 42"})
+        save_path = str(tmp_path / "saved.json")
+        args = argparse.Namespace(cases=cases, outputs=outputs,
+                                  json=False, save=save_path)
+        with pytest.raises(SystemExit) as ei:
+            cmd_run(args)
+        assert ei.value.code == 0
+        capsys.readouterr()
+        saved = json.loads(Path(save_path).read_text(encoding="utf-8"))
+        assert saved["tool"] == "agentci"
+        assert saved["version"] == "1.0.0"
+        assert saved["schema_version"] == 1
+        assert saved["agent"] == "x"
+        assert len(saved["results"]) == 3
+
+
+def test_version_flag_exits_0(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["agentci", "--version"])
+    with pytest.raises(SystemExit) as ei:
+        main()
+    assert ei.value.code == 0
+    assert capsys.readouterr().out.strip() == "agentci 1.0.0"
+
+
+def test_missing_file_error_envelope(capsys):
+    args = argparse.Namespace(cases="/nope/cases.json", outputs="/nope/o.json",
+                              json=False, save=None)
+    with pytest.raises(SystemExit) as ei:
+        cmd_run(args)
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    lines = [ln for ln in err.strip().splitlines() if ln.strip()]
+    assert lines[0].startswith("error: ")
+    envelope = json.loads(lines[-1])
+    assert envelope["error"]["code"] == "file_not_found"
+    assert "cases file not found" in envelope["error"]["message"]
+
+
+def test_compare_accepts_old_shape_baseline(capsys, tmp_path):
+    # Old baselines have no envelope keys; they must still load/compare.
+    base = make_report({"a": "pass", "b": "pass"})
+    new = make_report({"a": "pass", "b": "fail"})
+    # Strip envelope keys if present (make_report has none, but be explicit)
+    for rep in (base, new):
+        for k in ("tool", "version", "schema_version"):
+            rep.pop(k, None)
+    bp = write(tmp_path, "old_base.json", base)
+    np_ = write(tmp_path, "old_new.json", new)
+    with pytest.raises(SystemExit) as ei:
+        cmd_compare(argparse.Namespace(baseline=bp, new=np_, json=True))
+    assert ei.value.code == 1  # regression b: pass -> fail
+    parsed = json.loads(capsys.readouterr().out)
+    assert [d["id"] for d in parsed["regressions"]] == ["b"]
+
+
+def test_compare_json_envelope_keys(capsys, tmp_path):
+    base = make_report({"a": "pass"})
+    new = make_report({"a": "pass"})
+    bp = write(tmp_path, "base.json", base)
+    np_ = write(tmp_path, "new.json", new)
+    with pytest.raises(SystemExit) as ei:
+        cmd_compare(argparse.Namespace(baseline=bp, new=np_, json=True))
+    assert ei.value.code == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["tool"] == "agentci"
+    assert parsed["version"] == "1.0.0"
+    assert parsed["schema_version"] == 1
