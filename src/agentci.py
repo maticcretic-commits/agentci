@@ -20,8 +20,10 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -342,11 +344,46 @@ def _load_or_exit(loader, path, what):
         sys.exit(2)
 
 
+def _resolve_stdin(path):
+    """Materialize stdin to a temp file when path is '-' (the loaders
+    are path-based). Returns (real_path, tmp_path_or_None)."""
+    if path != "-":
+        return path, None
+    fd, name = tempfile.mkstemp(prefix="agentci-stdin-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(sys.stdin.read())
+    return name, name
+
+
+def _stdin_guard(a, b):
+    """stdin can be read once: at most one input may be '-'."""
+    if a == "-" and b == "-":
+        msg = "only one input may come from stdin"
+        print(f"error: {msg}", file=sys.stderr)
+        print(json.dumps({"error": {"code": "invalid_args",
+                                    "message": msg}}),
+              file=sys.stderr)
+        sys.exit(2)
+
+
+def _label(path):
+    return "<stdin>" if path == "-" else path
+
+
 def cmd_run(args):
-    agent, cases = _load_or_exit(load_cases, args.cases, "cases")
-    outputs = _load_or_exit(load_outputs, args.outputs, "outputs")
+    _stdin_guard(args.cases, args.outputs)
+    cases_path, tmp1 = _resolve_stdin(args.cases)
+    outputs_path, tmp2 = _resolve_stdin(args.outputs)
+    try:
+        agent, cases = _load_or_exit(load_cases, cases_path, "cases")
+        outputs = _load_or_exit(load_outputs, outputs_path, "outputs")
+    finally:
+        for tmp in (tmp1, tmp2):
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
     report = run_suite(agent, cases, outputs,
-                       cases_file=args.cases, outputs_file=args.outputs)
+                       cases_file=_label(args.cases),
+                       outputs_file=_label(args.outputs))
     payload = asdict(report)
     payload["tool"] = "agentci"
     payload["version"] = VERSION
@@ -365,10 +402,20 @@ def cmd_run(args):
 
 
 def cmd_compare(args):
-    baseline = _load_or_exit(load_report, args.baseline, "baseline report")
-    new = _load_or_exit(load_report, args.new, "new report")
+    _stdin_guard(args.baseline, args.new)
+    base_path, tmp1 = _resolve_stdin(args.baseline)
+    new_path, tmp2 = _resolve_stdin(args.new)
+    try:
+        baseline = _load_or_exit(load_report, base_path,
+                                 "baseline report")
+        new = _load_or_exit(load_report, new_path, "new report")
+    finally:
+        for tmp in (tmp1, tmp2):
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
     cmp = compare_reports(baseline, new,
-                          baseline_file=args.baseline, new_file=args.new)
+                          baseline_file=_label(args.baseline),
+                          new_file=_label(args.new))
     payload = asdict(cmp)
     payload["tool"] = "agentci"
     payload["version"] = VERSION
@@ -463,7 +510,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="evaluate saved outputs against a case suite")
-    r.add_argument("cases", help="path to the cases JSON file")
+    r.add_argument("cases", help="path to the cases JSON file "
+                               "('-' reads stdin; one input only)")
     r.add_argument("outputs", help="path to the saved outputs JSON file")
     r.add_argument("--json", action="store_true",
                    help="machine-readable JSON report")
@@ -472,7 +520,8 @@ def main():
     r.set_defaults(fn=cmd_run)
 
     c = sub.add_parser("compare", help="diff two run reports; exit 1 on regression")
-    c.add_argument("baseline", help="path to the baseline run report JSON")
+    c.add_argument("baseline", help="path to the baseline run report JSON "
+                                    "('-' reads stdin; one input only)")
     c.add_argument("new", help="path to the new run report JSON")
     c.add_argument("--json", action="store_true",
                    help="machine-readable JSON output")
