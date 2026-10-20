@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentci"
+version = "1.0.0"
+description = "Regression harness for AI agents. You changed the prompt — did the agent get better or worse?"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+agentci = "agentci:main"
+
+[tool.setuptools]
+py-modules = ["agentci"]
+package-dir = {"" = "src"}
