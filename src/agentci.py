@@ -26,6 +26,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+VERSION = "1.0.0"
+
 CHECK_TYPES = ("contains", "not_contains", "regex", "min_length")
 
 
@@ -321,13 +323,22 @@ def _load_or_exit(loader, path, what):
     try:
         return loader(path)
     except FileNotFoundError:
-        print(f"error: {what} file not found: {path}", file=sys.stderr)
+        msg = f"{what} file not found: {path}"
+        print(f"error: {msg}", file=sys.stderr)
+        print(json.dumps({"error": {"code": "file_not_found", "message": msg}}),
+              file=sys.stderr)
         sys.exit(2)
     except json.JSONDecodeError as e:
-        print(f"error: {what} file is not valid JSON: {path} ({e})", file=sys.stderr)
+        msg = f"{what} file is not valid JSON: {path} ({e})"
+        print(f"error: {msg}", file=sys.stderr)
+        print(json.dumps({"error": {"code": "invalid_json", "message": msg}}),
+              file=sys.stderr)
         sys.exit(2)
     except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+        msg = f"{e}"
+        print(f"error: {msg}", file=sys.stderr)
+        print(json.dumps({"error": {"code": "invalid_input", "message": msg}}),
+              file=sys.stderr)
         sys.exit(2)
 
 
@@ -336,11 +347,15 @@ def cmd_run(args):
     outputs = _load_or_exit(load_outputs, args.outputs, "outputs")
     report = run_suite(agent, cases, outputs,
                        cases_file=args.cases, outputs_file=args.outputs)
+    payload = asdict(report)
+    payload["tool"] = "agentci"
+    payload["version"] = VERSION
+    payload["schema_version"] = 1
     if args.save:
         Path(args.save).write_text(
-            json.dumps(asdict(report), indent=2), encoding="utf-8")
+            json.dumps(payload, indent=2), encoding="utf-8")
     if args.json:
-        print(json.dumps(asdict(report), indent=2))
+        print(json.dumps(payload, indent=2))
     else:
         print_run_text(report)
         if args.save:
@@ -354,8 +369,12 @@ def cmd_compare(args):
     new = _load_or_exit(load_report, args.new, "new report")
     cmp = compare_reports(baseline, new,
                           baseline_file=args.baseline, new_file=args.new)
+    payload = asdict(cmp)
+    payload["tool"] = "agentci"
+    payload["version"] = VERSION
+    payload["schema_version"] = 1
     if args.json:
-        print(json.dumps(asdict(cmp), indent=2))
+        print(json.dumps(payload, indent=2))
     else:
         print_compare_text(cmp)
     # 0 = no regression, 1 = regression found, 2 = input error
@@ -437,6 +456,10 @@ def main():
         prog="agentci",
         description="Regression harness for AI agents. "
                     "You changed the prompt — did the agent get better or worse?")
+    ap.add_argument("--version", action="version",
+                    version=f"agentci {VERSION}")
+    ap.add_argument("--no-color", action="store_true",
+                    help="disable color output (accepted harmlessly; no color emitted)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="evaluate saved outputs against a case suite")
