@@ -1,0 +1,19 @@
+# AgentForge family dogfood: this repo verifies itself with the
+# shared reusable workflow (maticcretic-commits/.github) — AgentCI re-runs the bundled case suite against the saved v1 outputs.
+# Reports are uploaded as run artifacts; a FAIL verdict fails the job.
+
+name: verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: maticcretic-commits/.github/.github/workflows/agentforge-verify.yml@main
+    with:
+      tool: agentci
+      args: run examples/cases.json examples/outputs.v1.json --json
