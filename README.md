@@ -1,23 +1,52 @@
 # AgentCI 🔁
 
-**You changed the prompt. Did the agent get better or worse?**
+**You tweaked the system prompt, the demo looked great, it shipped — and a behaviour that used to work quietly broke. Nobody found out until a user did.**
 
-Every agent team has lived this: someone tweaks a system prompt, the demo
-looks great, it ships — and a behavior that used to work quietly breaks.
-There was no test run to compare against, so nobody finds out until a
-user does.
+AgentCI is a regression harness for AI agents. Keep a suite of cases — an input plus the checks a good output must pass — run it against saved outputs, save the baseline, and after the next prompt change, compare: regressions fail the build. It never calls a live model, so it runs anywhere, including CI.
 
-AgentCI is a regression harness for AI agents. Keep a suite of test cases
-— an input plus the checks a good output must pass — run it against saved
-agent outputs, and save the report as a baseline. After the next prompt
-change, run again and **compare**: regressions fail the build.
-
-Offline-first: AgentCI evaluates saved outputs and never calls a live
-model API, so it runs anywhere — including your CI pipeline.
+*Part of **AgentForge** — verify AI-agent work before you ship it.*
+*The family: [AgentProof](https://github.com/maticcretic-commits/agentproof) · [PromptRE](https://github.com/maticcretic-commits/promptre) · [AgentCI](https://github.com/maticcretic-commits/agentci) · [SecretScan](https://github.com/maticcretic-commits/secretscan) · [CostLedger](https://github.com/maticcretic-commits/costledger) · [SchemaGuard](https://github.com/maticcretic-commits/schemaguard) · [SkillAudit](https://github.com/maticcretic-commits/skillaudit) · [PromptDiff](https://github.com/maticcretic-commits/promptdiff) · [TraceTape](https://github.com/maticcretic-commits/tracetape) · [PromptLint](https://github.com/maticcretic-commits/promptlint) · [ClaimCheck](https://github.com/maticcretic-commits/claimcheck) · [TrustBadge](https://github.com/maticcretic-commits/trustbadge)*
 
 ```bash
-python src/agentci.py init
-python src/agentci.py run agentci.cases.json agentci.outputs.json --save baseline_report.json
+$ agentci run examples/cases.json examples/outputs.v2.json
+```
+
+```
+====================================================================
+AgentCI run — support-agent
+====================================================================
+Cases:   examples/cases.json
+Outputs: examples/outputs.v2.json
+
+❌ refund-flow — FAIL (2/4 checks)
+     ✗ [contains] output does not contain 'confirm' (case-insensitive)
+     ✗ [not_contains] output contains forbidden 'guaranteed' (case-insensitive)
+✅ password-reset — PASS (3/3 checks)
+✅ angry-user-tone — PASS (3/3 checks)
+✅ data-privacy — PASS (2/2 checks)
+
+Score: 3/4 cases passed (75%) — FAIL
+```
+
+*Exit code 1 — `refund-flow` fails against the case suite (the v2 outputs dropped a required confirmation and used a forbidden word). `agentci compare` against a saved baseline names the regression the same way.*
+
+## Install
+
+```bash
+pipx install git+https://github.com/maticcretic-commits/agentci
+# or, into the current environment:
+pip install git+https://github.com/maticcretic-commits/agentci
+```
+
+Then run it as `agentci …` (Python 3.9+, no dependencies — stdlib only).
+PyPI release planned; until then, the git URL above is the install path.
+
+From source — it is a single file, so no install is needed at all:
+
+```bash
+git clone https://github.com/maticcretic-commits/agentci
+cd agentci
+python src/agentci.py …
 ```
 
 ## The checks
@@ -144,10 +173,39 @@ outputs. AgentCI makes those expectations explicit, versioned, and
 diffable, so "the new prompt feels better" becomes "the new prompt
 passes everything the old one did, plus two cases it used to fail."
 
+## Limitations
+
+- AgentCI evaluates *saved* outputs; it never calls a live model, so it
+  cannot catch flakiness or drift — only differences between the outputs
+  you feed it.
+- Checks are deliberately simple (contains, not-contains, regex, length,
+  JSON validity): they verify shape and key content, not whether an answer
+  is *good*.
+- A suite only protects the behaviours it covers; an uncovered behaviour
+  can regress silently.
+
+## Exit codes & JSON output
+
+All AgentForge tools share one contract (full text in
+[CONVENTIONS.md](CONVENTIONS.md)):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean / PASS — no findings at or above the tool's fail threshold |
+| `1` | Findings / FAIL — the tool ran fine; the answer is “no” |
+| `2` | Caller error — bad arguments, missing or unreadable input |
+| `3` | Environment error — the tool itself could not run |
+
+On a caller error the tool also prints one JSON line to stderr:
+`{"error": {"code": "file_not_found", "message": "no such file: x"}}`.
+
+JSON output (`--json`) always carries the family envelope —
+`{"tool": "agentci", "version": "1.0.0", "schema_version": 1}` — alongside
+the tool's own payload keys, unchanged.
+
 ## Part of AgentForge
 
-AgentCI is the third tool in the [AgentForge](https://github.com/maticcretic-commits)
-trust layer for AI agents:
+AgentCI is one of the 12 tools in the [AgentForge](https://github.com/maticcretic-commits) family — offline, stdlib-only tools to **verify AI-agent work before you ship it**:
 
 - **AgentProof** — verify agent work — [github.com/maticcretic-commits/agentproof](https://github.com/maticcretic-commits/agentproof)
 - **PromptRE** — reverse-engineer agent prompts — [github.com/maticcretic-commits/promptre](https://github.com/maticcretic-commits/promptre)
