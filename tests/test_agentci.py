@@ -387,3 +387,32 @@ def test_compare_json_envelope_keys(capsys, tmp_path):
     assert parsed["tool"] == "agentci"
     assert parsed["version"] == "1.0.0"
     assert parsed["schema_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: stdin inputs (pipe composability)
+# ---------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+
+
+def test_run_stdin_outputs():
+    cli = Path(__file__).parent.parent / "src" / "agentci.py"
+    ex = Path(__file__).parent.parent / "examples"
+    proc = subprocess.run(
+        [sys.executable, str(cli), "run", str(ex / "cases.json"), "-",
+         "--json"],
+        input=(ex / "outputs.v2.json").read_text(),
+        capture_output=True, text=True)
+    assert proc.returncode in (0, 1)
+    data = json.loads(proc.stdout)  # stdout is pure JSON
+    assert data["tool"] == "agentci"
+    assert data["outputs_file"] == "<stdin>"
+
+
+def test_run_stdin_both_sides_rejected():
+    cli = Path(__file__).parent.parent / "src" / "agentci.py"
+    proc = subprocess.run(
+        [sys.executable, str(cli), "run", "-", "-"],
+        input="{}", capture_output=True, text=True)
+    assert proc.returncode == 2  # stdin can only be read once
