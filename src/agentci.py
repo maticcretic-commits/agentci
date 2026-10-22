@@ -16,6 +16,13 @@ Usage:
     agentci init                                # scaffold a sample suite
     agentci run <cases.json> <outputs.json> [--json] [--save report.json]
     agentci compare <baseline.json> <new.json> [--json]
+    agentci bundle <baseline.bundle.json> <new.bundle.json>
+                   [--budget 1.50] [--json]
+
+`bundle` is the regression proof over TraceTape proof bundles: it
+fails when the new run's sealed evidence is weaker than the
+baseline's — evidence lost, bundle schema broken, cost over budget,
+or the TrustBadge score degraded.
 """
 
 import argparse
@@ -26,9 +33,10 @@ import sys
 import tempfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CHECK_TYPES = ("contains", "not_contains", "regex", "min_length")
 
@@ -318,6 +326,218 @@ def print_compare_text(c: CompareReport):
 
 
 # ---------------------------------------------------------------------------
+# Bundle regression (TraceTape proof bundles)
+#
+# A proof bundle (written by `tracetape bundle`) seals a run's
+# evidence: the tape, claims, a skill manifest, tool reports, a cost
+# record, a schema contract, a TrustBadge score — each named by
+# SHA-256. AgentCI treats a pair of bundles the way `compare` treats
+# a pair of run reports: the new bundle must not be *weaker* than
+# the baseline. Four regression classes:
+#
+#   schema   — the new bundle no longer parses as a proof bundle.
+#   evidence — a sealed section / claim / skill file / tool report
+#              that the baseline carried is gone, or the tape shrank.
+#   cost     — the new cost total exceeds --budget (or the total
+#              vanished while a budget is being enforced).
+#   score    — the TrustBadge composite went down.
+#
+# Changed-but-present evidence (a skill file with a new hash, a
+# bigger tape) is reported as a note / improvement, never silently
+# passed over.
+# ---------------------------------------------------------------------------
+
+BUNDLE_SECTIONS = ("tape", "claims", "skill_manifest", "tool_outputs",
+                   "cost_record", "schema_contract", "trustbadge")
+
+
+@dataclass
+class BundleFinding:
+    category: str  # "schema" | "evidence" | "cost" | "score"
+    detail: str
+
+
+@dataclass
+class BundleCompare:
+    baseline_file: str = ""
+    new_file: str = ""
+    regressions: list = field(default_factory=list)
+    improvements: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+    @property
+    def verdict(self):
+        return "REGRESSION" if self.regressions else "OK"
+
+
+def bundle_problems(doc):
+    """Structural problems of a would-be proof bundle ([] = sound).
+    This is AgentCI's own reading of the bundle format — the same
+    mirror-the-format pattern TrustBadge uses for sibling reports."""
+    if not isinstance(doc, dict):
+        return ["top level is not a JSON object"]
+    problems = []
+    if doc.get("kind") != "proof-bundle":
+        problems.append(f"kind is {doc.get('kind')!r}, "
+                        f"not 'proof-bundle'")
+    bv = doc.get("bundle_version")
+    if not isinstance(bv, int) or isinstance(bv, bool) or bv < 1:
+        problems.append(f"bundle_version is {bv!r}, not a positive int")
+    sections = doc.get("sections")
+    if not isinstance(sections, dict):
+        problems.append("sections is missing or not an object")
+        return problems
+    tape = sections.get("tape")
+    if not isinstance(tape, dict):
+        problems.append("sections.tape is missing or not an object")
+    else:
+        for key in ("sha256", "events", "runs"):
+            if key not in tape:
+                problems.append(f"sections.tape has no '{key}'")
+    return problems
+
+
+def _decimal_or_none(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() else None
+
+
+def compare_bundles(baseline, new, budget=None,
+                    baseline_file="", new_file=""):
+    """Diff two bundle dicts. `budget` is a Decimal or None.
+    Assumes the baseline is structurally sound (the caller gates
+    that as a caller error); problems in the NEW bundle are
+    regressions, not caller errors."""
+    cmp = BundleCompare(baseline_file=baseline_file, new_file=new_file)
+
+    def reg(category, detail):
+        cmp.regressions.append(BundleFinding(category, detail))
+
+    for problem in bundle_problems(new):
+        reg("schema", f"new bundle: {problem}")
+    if cmp.regressions:
+        return cmp  # nothing else in it can be trusted
+
+    bsec = baseline.get("sections", {})
+    nsec = new.get("sections", {})
+
+    for name in BUNDLE_SECTIONS:
+        if name in bsec and name not in nsec:
+            reg("evidence", f"section '{name}' was sealed in the "
+                            f"baseline and is missing now")
+        elif name in nsec and name not in bsec:
+            cmp.improvements.append(f"section '{name}' gained")
+
+    btape, ntape = bsec.get("tape", {}), nsec.get("tape", {})
+    if isinstance(btape.get("events"), int) \
+            and isinstance(ntape.get("events"), int):
+        if ntape["events"] < btape["events"]:
+            reg("evidence", f"tape shrank: {btape['events']} → "
+                            f"{ntape['events']} events")
+        elif ntape["events"] > btape["events"]:
+            cmp.improvements.append(
+                f"tape grew: {btape['events']} → {ntape['events']} "
+                f"events")
+    bruns, nruns = btape.get("runs"), ntape.get("runs")
+    if isinstance(bruns, list) and isinstance(nruns, list) \
+            and len(nruns) < len(bruns):
+        reg("evidence", f"tape lost runs: {len(bruns)} → {len(nruns)}")
+
+    if "claims" in bsec and "claims" in nsec:
+        b_hashes = {i.get("sha256") for i in
+                    bsec["claims"].get("items", [])}
+        n_hashes = {i.get("sha256") for i in
+                    nsec["claims"].get("items", [])}
+        lost = b_hashes - n_hashes
+        if lost:
+            reg("evidence", f"{len(lost)} sealed claim(s) lost "
+                            f"(claim hashes no longer present)")
+        elif len(n_hashes) > len(b_hashes):
+            cmp.improvements.append(
+                f"claims grew: {len(b_hashes)} → {len(n_hashes)}")
+
+    if "skill_manifest" in bsec and "skill_manifest" in nsec:
+        b_files = {f.get("path"): f.get("sha256") for f in
+                   bsec["skill_manifest"].get("files", [])}
+        n_files = {f.get("path"): f.get("sha256") for f in
+                   nsec["skill_manifest"].get("files", [])}
+        for path in sorted(set(b_files) - set(n_files)):
+            reg("evidence", f"skill file lost: {path}")
+        for path in sorted(set(b_files) & set(n_files)):
+            if b_files[path] != n_files[path]:
+                cmp.notes.append(f"skill file changed: {path}")
+
+    if "tool_outputs" in bsec and "tool_outputs" in nsec:
+        b_tools = {e.get("tool") for e in bsec["tool_outputs"]}
+        n_tools = {e.get("tool") for e in nsec["tool_outputs"]}
+        for tool in sorted(t for t in b_tools - n_tools if t):
+            reg("evidence", f"tool report lost: {tool}")
+
+    bcost = bsec.get("cost_record", {}).get("total") \
+        if "cost_record" in bsec else None
+    ncost = nsec.get("cost_record", {}).get("total") \
+        if "cost_record" in nsec else None
+    b_total, n_total = _decimal_or_none(bcost), _decimal_or_none(ncost)
+    if budget is not None:
+        if n_total is None:
+            reg("cost", "new bundle has no readable cost total — "
+                        "the budget cannot be proven")
+        elif n_total > budget:
+            reg("cost", f"cost {n_total} exceeds budget {budget}")
+    if b_total is not None and n_total is not None \
+            and n_total != b_total:
+        cmp.notes.append(f"cost moved: {b_total} → {n_total}")
+
+    b_score = bsec.get("trustbadge", {}).get("composite") \
+        if "trustbadge" in bsec else None
+    n_score = nsec.get("trustbadge", {}).get("composite") \
+        if "trustbadge" in nsec else None
+    if isinstance(b_score, (int, float)) \
+            and isinstance(n_score, (int, float)):
+        if n_score < b_score:
+            reg("score", f"TrustBadge composite degraded: "
+                         f"{b_score} → {n_score}")
+        elif n_score > b_score:
+            cmp.improvements.append(
+                f"TrustBadge composite improved: {b_score} → "
+                f"{n_score}")
+    return cmp
+
+
+def print_bundle_text(c: BundleCompare):
+    icon = "❌" if c.regressions else "✅"
+    print("=" * 68)
+    print(f"AgentCI bundle — {icon} {c.verdict}")
+    print("=" * 68)
+    if c.baseline_file:
+        print(f"Baseline: {c.baseline_file}")
+    if c.new_file:
+        print(f"New:      {c.new_file}")
+    print()
+    print(f"🔻 Regressions ({len(c.regressions)}):")
+    for f in c.regressions:
+        print(f"  - [{f.category}] {f.detail}")
+    if not c.regressions:
+        print("  (none)")
+    print()
+    print(f"🔺 Improvements ({len(c.improvements)}):")
+    for d in c.improvements:
+        print(f"  - {d}")
+    if not c.improvements:
+        print("  (none)")
+    if c.notes:
+        print()
+        print("Notes:")
+        for d in c.notes:
+            print(f"  - {d}")
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -428,6 +648,58 @@ def cmd_compare(args):
     sys.exit(1 if cmp.regressions else 0)
 
 
+def load_bundle(path):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    doc = json.loads(raw.decode("utf-8"))  # JSONDecodeError propagates
+    if not isinstance(doc, dict):
+        raise ValueError(f"bundle file is not a JSON object: {path}")
+    return doc
+
+
+def _caller_error(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    print(json.dumps({"error": {"code": "invalid_input",
+                                "message": msg}}), file=sys.stderr)
+    sys.exit(2)
+
+
+def cmd_bundle(args):
+    _stdin_guard(args.baseline, args.new)
+    base_path, tmp1 = _resolve_stdin(args.baseline)
+    new_path, tmp2 = _resolve_stdin(args.new)
+    try:
+        baseline = _load_or_exit(load_bundle, base_path, "bundle")
+        new = _load_or_exit(load_bundle, new_path, "bundle")
+    finally:
+        for tmp in (tmp1, tmp2):
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
+    problems = bundle_problems(baseline)
+    if problems:
+        _caller_error("baseline is not a sound proof bundle: "
+                      + "; ".join(problems))
+    budget = None
+    if args.budget is not None:
+        budget = _decimal_or_none(args.budget)
+        if budget is None:
+            _caller_error(f"--budget is not a number: {args.budget!r}")
+    c = compare_bundles(baseline, new, budget=budget,
+                        baseline_file=_label(args.baseline),
+                        new_file=_label(args.new))
+    payload = asdict(c)
+    payload["tool"] = "agentci"
+    payload["version"] = VERSION
+    payload["schema_version"] = 1
+    payload["verdict"] = c.verdict
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print_bundle_text(c)
+    # 0 = no regression, 1 = regression found, 2 = input error
+    sys.exit(1 if c.regressions else 0)
+
+
 CASES_TEMPLATE = {
     "agent": "sample-support-agent",
     "description": "Sample AgentCI suite. Edit the cases to match your agent, "
@@ -526,6 +798,19 @@ def main():
     c.add_argument("--json", action="store_true",
                    help="machine-readable JSON output")
     c.set_defaults(fn=cmd_compare)
+
+    b = sub.add_parser(
+        "bundle",
+        help="regression-check a new TraceTape proof bundle against "
+             "a baseline bundle")
+    b.add_argument("baseline")
+    b.add_argument("new")
+    b.add_argument("--budget", default=None,
+                   help="fail if the new bundle's cost total exceeds "
+                        "this amount (e.g. 1.50)")
+    b.add_argument("--json", action="store_true",
+                   help="machine-readable JSON output")
+    b.set_defaults(fn=cmd_bundle)
 
     i = sub.add_parser("init", help="scaffold a sample suite + passing outputs")
     i.add_argument("--force", action="store_true")
