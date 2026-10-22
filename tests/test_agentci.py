@@ -311,7 +311,7 @@ def test_run_json_envelope_keys(capsys):
         assert ei.value.code == 0
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["tool"] == "agentci"
-        assert parsed["version"] == VERSION == "1.0.0"
+        assert parsed["version"] == VERSION == "1.1.0"
         assert parsed["schema_version"] == 1
 
 
@@ -330,7 +330,7 @@ def test_run_save_file_has_envelope_keys(capsys, tmp_path):
         capsys.readouterr()
         saved = json.loads(Path(save_path).read_text(encoding="utf-8"))
         assert saved["tool"] == "agentci"
-        assert saved["version"] == "1.0.0"
+        assert saved["version"] == "1.1.0"
         assert saved["schema_version"] == 1
         assert saved["agent"] == "x"
         assert len(saved["results"]) == 3
@@ -341,7 +341,7 @@ def test_version_flag_exits_0(monkeypatch, capsys):
     with pytest.raises(SystemExit) as ei:
         main()
     assert ei.value.code == 0
-    assert capsys.readouterr().out.strip() == "agentci 1.0.0"
+    assert capsys.readouterr().out.strip() == "agentci 1.1.0"
 
 
 def test_missing_file_error_envelope(capsys):
@@ -385,7 +385,7 @@ def test_compare_json_envelope_keys(capsys, tmp_path):
     assert ei.value.code == 0
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["tool"] == "agentci"
-    assert parsed["version"] == "1.0.0"
+    assert parsed["version"] == "1.1.0"
     assert parsed["schema_version"] == 1
 
 
@@ -416,3 +416,176 @@ def test_run_stdin_both_sides_rejected():
         [sys.executable, str(cli), "run", "-", "-"],
         input="{}", capture_output=True, text=True)
     assert proc.returncode == 2  # stdin can only be read once
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: bundle regression (agentci bundle)
+# ---------------------------------------------------------------------------
+
+def _bundle(sections=None, **over):
+    doc = {
+        "tool": "tracetape", "version": "1.1.0", "schema_version": 1,
+        "kind": "proof-bundle", "bundle_version": 1,
+        "sections": {
+            "tape": {"file": "tape.jsonl", "sha256": "a" * 64,
+                     "events": 17, "runs": [{"run": "r1"},
+                                            {"run": "r2"}]},
+            "claims": {"file": "claims.md", "sha256": "b" * 64,
+                       "count": 2,
+                       "items": [{"line": 3, "sha256": "c" * 64},
+                                 {"line": 4, "sha256": "d" * 64}]},
+            "skill_manifest": {
+                "dir": "skill", "name": "s",
+                "files": [{"path": "SKILL.md", "sha256": "e" * 64,
+                           "bytes": 10},
+                          {"path": "run.py", "sha256": "f" * 64,
+                           "bytes": 5}],
+                "file_count": 2, "total_bytes": 15},
+            "tool_outputs": [{"file": "tb.json", "sha256": "1" * 64,
+                              "tool": "trustbadge"}],
+            "cost_record": {"file": "cost.json", "sha256": "2" * 64,
+                            "total": "0.42",
+                            "total_key": "totals.cost_usd"},
+            "trustbadge": {"file": "tb.json", "sha256": "3" * 64,
+                           "composite": 88, "capped": False},
+        },
+        "bundle_sha256": "9" * 64,
+    }
+    if sections is not None:
+        doc["sections"] = sections
+    doc.update(over)
+    return doc
+
+
+def _write_pair(tmp_path, baseline, new):
+    b = tmp_path / "base.json"
+    n = tmp_path / "new.json"
+    b.write_text(json.dumps(baseline))
+    n.write_text(json.dumps(new))
+    return str(b), str(n)
+
+
+def _run_bundle(*argv):
+    import subprocess
+    import sys as _sys
+    cli = Path(__file__).parent.parent / "src" / "agentci.py"
+    return subprocess.run([_sys.executable, str(cli), "bundle", *argv],
+                          capture_output=True, text=True)
+
+
+def test_bundle_identical_is_ok(tmp_path):
+    b, n = _write_pair(tmp_path, _bundle(), _bundle())
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 0
+    data = json.loads(r.stdout)
+    assert data["verdict"] == "OK"
+    assert data["regressions"] == []
+    assert data["tool"] == "agentci"
+    assert data["version"] == "1.1.0"
+
+
+def test_bundle_section_loss_is_regression(tmp_path):
+    new = _bundle()
+    del new["sections"]["claims"]
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 1
+    data = json.loads(r.stdout)
+    assert data["verdict"] == "REGRESSION"
+    assert any(f["category"] == "evidence" and "claims" in f["detail"]
+               for f in data["regressions"])
+
+
+def test_bundle_claim_loss_is_regression(tmp_path):
+    new = _bundle()
+    new["sections"]["claims"]["items"] = \
+        new["sections"]["claims"]["items"][:1]
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n)
+    assert r.returncode == 1
+    assert "claim(s) lost" in r.stdout
+
+
+def test_bundle_skill_file_loss_is_regression(tmp_path):
+    new = _bundle()
+    new["sections"]["skill_manifest"]["files"] = \
+        new["sections"]["skill_manifest"]["files"][:1]
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 1
+    assert any("skill file lost: run.py" in f["detail"]
+               for f in json.loads(r.stdout)["regressions"])
+
+
+def test_bundle_tape_shrink_is_regression(tmp_path):
+    new = _bundle()
+    new["sections"]["tape"]["events"] = 9
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 1
+    assert any("tape shrank" in f["detail"]
+               for f in json.loads(r.stdout)["regressions"])
+
+
+def test_bundle_broken_schema_is_regression(tmp_path):
+    b, n = _write_pair(tmp_path, _bundle(),
+                       {"kind": "something-else"})
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 1
+    assert any(f["category"] == "schema"
+               for f in json.loads(r.stdout)["regressions"])
+
+
+def test_bundle_budget_exceeded_is_regression(tmp_path):
+    new = _bundle()
+    new["sections"]["cost_record"]["total"] = "2.75"
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--budget", "1.50", "--json")
+    assert r.returncode == 1
+    assert any(f["category"] == "cost"
+               for f in json.loads(r.stdout)["regressions"])
+    # Same pair without a budget: cost movement is a note, not a fail.
+    r2 = _run_bundle(b, n, "--json")
+    assert r2.returncode == 0
+
+
+def test_bundle_score_degradation_is_regression(tmp_path):
+    new = _bundle()
+    new["sections"]["trustbadge"]["composite"] = 41
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 1
+    assert any(f["category"] == "score"
+               for f in json.loads(r.stdout)["regressions"])
+
+
+def test_bundle_improvements_reported(tmp_path):
+    new = _bundle()
+    new["sections"]["tape"]["events"] = 25
+    new["sections"]["trustbadge"]["composite"] = 93
+    b, n = _write_pair(tmp_path, _bundle(), new)
+    r = _run_bundle(b, n, "--json")
+    assert r.returncode == 0
+    imps = json.loads(r.stdout)["improvements"]
+    assert any("tape grew" in i for i in imps)
+    assert any("composite improved" in i for i in imps)
+
+
+def test_bundle_unsound_baseline_is_caller_error(tmp_path):
+    b, n = _write_pair(tmp_path, {"kind": "nope"}, _bundle())
+    r = _run_bundle(b, n)
+    assert r.returncode == 2
+    assert '"code": "invalid_input"' in r.stderr
+
+
+def test_bundle_missing_file_is_caller_error(tmp_path):
+    r = _run_bundle(str(tmp_path / "nope.json"), str(tmp_path / "x.json"))
+    assert r.returncode == 2
+    assert '"code": "file_not_found"' in r.stderr
+
+
+def test_bundle_bad_budget_is_caller_error(tmp_path):
+    b, n = _write_pair(tmp_path, _bundle(), _bundle())
+    r = _run_bundle(b, n, "--budget", "soon")
+    assert r.returncode == 2
+    assert '"code": "invalid_input"' in r.stderr
