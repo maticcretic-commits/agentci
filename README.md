@@ -88,6 +88,40 @@ Exit codes: `run` → `0` = all cases pass, `1` = any case fails or is
 missing, `2` = input error. `compare` → `0` = no regression, `1` =
 regression found, `2` = input error. Drop both in GitHub Actions.
 
+## Bundle regression (TraceTape proof bundles)
+
+`agentci bundle` applies the same regression idea one level up: not
+to run reports, but to **proof bundles** — the sealed evidence
+documents written by `tracetape bundle`. The new bundle must not be
+weaker than the baseline:
+
+```bash
+agentci bundle baseline.bundle.json new.bundle.json
+agentci bundle baseline.bundle.json new.bundle.json --budget 1.50 --json
+```
+
+```
+AgentCI bundle — ❌ REGRESSION
+Baseline: baseline.bundle.json
+New:      new.bundle.json
+
+🔻 Regressions (2):
+  - [evidence] section 'claims' was sealed in the baseline and is missing now
+  - [cost] cost 2.75 exceeds budget 1.50
+```
+
+Four regression classes: `schema` (the new bundle no longer parses
+as a proof bundle), `evidence` (a sealed section, claim, skill
+file or tool report is gone, or the tape shrank), `cost` (over
+`--budget`, or the cost total vanished while a budget is enforced),
+and `score` (the TrustBadge composite went down). Improvements —
+sections or claims gained, a bigger tape, a better score — are
+reported, and changed-but-present evidence (a skill file with a new
+hash) shows up as a note, never silently passed over. Exit codes
+mirror `compare`: `0` = no regression, `1` = regression, `2` =
+input error (including an unsound baseline, which cannot anchor a
+comparison).
+
 ## File formats
 
 **Cases** (`agentci.cases.json`) — an object with the agent name and a
@@ -200,7 +234,7 @@ On a caller error the tool also prints one JSON line to stderr:
 `{"error": {"code": "file_not_found", "message": "no such file: x"}}`.
 
 JSON output (`--json`) always carries the family envelope —
-`{"tool": "agentci", "version": "1.0.0", "schema_version": 1}` — alongside
+`{"tool": "agentci", "version": "1.1.0", "schema_version": 1}` — alongside
 the tool's own payload keys, unchanged.
 
 ## Part of AgentForge
